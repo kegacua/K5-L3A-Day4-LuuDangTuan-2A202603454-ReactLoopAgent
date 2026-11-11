@@ -1,6 +1,7 @@
 """Bốn provider cùng một interface. Không chứa agent loop."""
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 
@@ -12,16 +13,32 @@ CONFIG = {
 }
 
 
+RETRY_STATUS = {429, 500, 502, 503, 504}
+MAX_RETRIES = int(os.getenv('PROVIDER_MAX_RETRIES', '5'))
+
+
 def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+    data = json.dumps(payload).encode()
+    for attempt in range(MAX_RETRIES + 1):
+        req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json', **headers})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            # Rate limit / lỗi tạm thời của provider LLM: retry có giới hạn, tôn trọng Retry-After.
+            if exc.code in RETRY_STATUS and attempt < MAX_RETRIES:
+                retry_after = exc.headers.get('Retry-After') if exc.headers else None
+                try:
+                    wait = min(float(retry_after), 60.0) if retry_after else min(2 ** attempt * 3, 45)
+                except ValueError:
+                    wait = min(2 ** attempt * 3, 45)
+                exc.close()
+                time.sleep(wait)
+                continue
+            # Do not print response bodies: they may contain account or request data.
+            raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
 
 
 class Provider:
